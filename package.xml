@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>grid_mapping</name>
+  <version>0.0.1</version>
+  <description>Occupancy grid mapping node</description>
+  <maintainer email="azul@todo.todo">azul</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Sacar o agregar -->
+  <depend>rclcpp</depend> <!-- Nodo ROS2 -->
+  <depend>nav_msgs</depend> <!-- Para OccupoancyGrid y Odometry -->
+  <depend>geometry_msgs</depend> <!-- Poses -->
+  <depend>tf2</depend> <!-- Transformaciones -->
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>std_msgs</depend> <!-- Mensajes -->
+  <depend>sensor_msgs</depend>  <!-- Mensajes de sensores -->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
