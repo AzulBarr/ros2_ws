@@ -30,13 +30,15 @@ OccupancyGridBuilder::OccupancyGridBuilder() : Node("mapping_node"), tf_buffer(t
     // Publisher del mapa
     map_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/map", 10);
 
-    this->declare_parameter("robot_frame", std::string("base_link"));
+    //this->declare_parameter("robot_frame", std::string("base_link"));
     //this->declare_parameter("publish_robot_frame", std::string("base_link"));
     this->declare_parameter("laser_frame", std::string("laser"));
+    this->declare_parameter("map_frame", std::string("map"));
 
-    this->get_parameter("robot_frame", robot_frame);
+    //this->get_parameter("robot_frame", robot_frame);
     //this->get_parameter("publish_robot_frame", publish_robot_frame);
     this->get_parameter("laser_frame", laser_frame);
+    this->get_parameter("map_frame", map_frame);
     
 
     RCLCPP_INFO(this->get_logger(), "Esperando dimensiones de CoppeliaSim...");
@@ -67,7 +69,13 @@ void OccupancyGridBuilder::dims_callback(const std_msgs::msg::Float32MultiArray:
     log_odds_grid_.assign(width_cells_ * height_cells_, 0.0f);
     
     // Grilla para ROS (visualización)
-    grid_data_.assign(width_cells_ * height_cells_, -1); // equivale a: grid_data_.clear(); grid_data_.resize(width * height); for (...) grid_data_[i] = -1;
+    grid_data_.assign(width_cells_ * height_cells_, 0); // equivale a: grid_data_.clear(); grid_data_.resize(width * height); for (...) grid_data_[i] = -1;
+    /*for (size_t i = 10; i < 50; ++i){
+        grid_data_[i] = -1; // Nunca observado
+    }
+    for (size_t i = 60; i < grid_data_.size(); ++i){
+        grid_data_[i] = 100; // Nunca observado
+    }*/
 
     map_initialized_ = true;
     RCLCPP_INFO(this->get_logger(), "Mapa inicializado: %u x %u celdas", width_cells_, height_cells_);
@@ -79,6 +87,10 @@ void OccupancyGridBuilder::pose_callback(const geometry_msgs::msg::Pose::SharedP
 }
 
 void OccupancyGridBuilder::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+    /*
+    El mensaje está en el marco del láser y en coordenadas polares
+    Lo quiero pasar a coordenadas cartesianas en el marco del mapa
+    */
     if (!map_initialized_ || !pose_received_) return;
 
     if (!update_laser_tf(msg->header.stamp))
@@ -86,10 +98,8 @@ void OccupancyGridBuilder::scan_callback(const sensor_msgs::msg::LaserScan::Shar
         RCLCPP_WARN(this->get_logger(), "%s -> %s transform not yet received", laser_frame.c_str(), robot_frame.c_str());
         return;
     }
-
     /* Convertir range,bearing a puntos cartesianos x,y,0.
-    * Descartando aquellas mediciones por fuera de los rangos validos */
-
+    Descartando aquellas mediciones por fuera de los rangos validos */
     for (long unsigned int i = 0; i < msg->ranges.size(); i++){
         /* Utilizar la informacion del mensaje para filtrar y convertir */
         float range = msg->ranges[i];
@@ -102,9 +112,15 @@ void OccupancyGridBuilder::scan_callback(const sensor_msgs::msg::LaserScan::Shar
         if (range <= range_max && range >= range_min){
             // CASO 1: DETECTÓ OBSTÁCULO
             tf2::Vector3 p(range * cos(angle_min + angle_increment * i), range * sin(angle_min + angle_increment * i), 0);
-            p = laser_transform * p;
+            p = transform_laser_world * p;
             update_cell_log_odds(p.x(), p.y(), l_occ_); // Sumamos probabilidad de ocupado
         } else {
+            for (float r = range_min; r <= range_max; r += resolution_){
+                tf2::Vector3 p(r * cos(angle_min + angle_increment * i), r * sin(angle_min + angle_increment * i), 0);
+                p = transform_laser_world * p;
+                update_cell_log_odds(p.x(), p.y(), l_free_); // Restamos probabilidad (espacio libre)
+            }
+
             // CASO 2: NO DETECTÓ NADA (dist == -1)
             // Se marca espacio libre a lo largo del rayo.
             //float fx = (range_max * 0.5f) * cos(angle_min + angle_increment * i); // Ejemplo: punto medio
@@ -113,83 +129,45 @@ void OccupancyGridBuilder::scan_callback(const sensor_msgs::msg::LaserScan::Shar
             //p = laser_transform * p;
             //update_cell_log_odds(p.x(), p.y(), l_free_); // Restamos probabilidad (espacio libre)
         }
-        // AHORA HAY QUE CONVERTIRLO AL MARCO DE REFERENCIA DEL MAPA (WORLD)?
     }
     // 3. Convertir Log-Odds a OccupancyGrid (0-100) y publicar
     update_occupancy_grid();
     publish_map();
-/*
-    // 1. Obtener posición y rotación (Yaw) del robot
-    float rx = current_pose_.position.x;
-    float ry = current_pose_.position.y;
-    float yaw = quaternion_to_yaw(current_pose_.orientation);
-
-    // 2. Procesar cada rayo del láser
-    float angle = msg->angle_min;
-    for (size_t i = 0; i < msg->ranges.size(); ++i) {
-        float dist = msg->ranges[i];
-        
-        if (dist >= msg->range_min && dist <= msg->range_max) {
-            // CASO 1: DETECTÓ OBSTÁCULO
-            float ox = rx + dist * std::cos(yaw + angle);
-            float oy = ry + dist * std::sin(yaw + angle);
-            update_cell_log_odds(ox, oy, l_occ_); // Sumamos probabilidad de ocupado
-
-            // (Opcional) Limpiar el camino antes del obstáculo
-            // limpiar_camino_libre(rx, ry, ox, oy); 
-        } else {
-            // CASO 2: NO DETECTÓ NADA (dist == -1)
-            // Aquí es donde "limpias" el mapa. 
-            // No marcas un obstáculo a los 8m, sino que marcas espacio libre 
-            // en algún punto o a lo largo del rayo.
-            float fx = rx + (dist * 0.5f) * std::cos(yaw + angle); // Ejemplo: punto medio
-            float fy = ry + (dist * 0.5f) * std::sin(yaw + angle);
-            update_cell_log_odds(fx, fy, l_free_); // Restamos probabilidad (espacio libre)
-        }
-            // OPCIONAL: Raycasting para marcar espacio libre entre robot y objeto
-            // Aquí podrías implementar un algoritmo de Bresenham
-        angle += msg->angle_increment;
-    }
-    // 3. Convertir Log-Odds a OccupancyGrid (0-100) y publicar
-    update_occupancy_grid();
-    publish_map();
-*/
 }
 
 // ENTENDER Y MODIFICAR SI ES NECESARIO
 void OccupancyGridBuilder::update_cell_log_odds(float wx, float wy, float l_update) {
     // Convertir coordenadas de mundo a índices de grilla
-    int gx = static_cast<int>((wx - origin_x_) / resolution_);
-    int gy = static_cast<int>((wy - origin_y_) / resolution_);
-
-    if (gx >= 0 && gx < (int)width_cells_ && gy >= 0 && gy < (int)height_cells_) {
-        int index = gy * width_cells_ + gx;
-        
-        // Sumar Log-Odds y aplicar límites (clamping)
+    int index;
+    bool valid = worldToIndex(wx, wy, index);
+    if (!valid) return;
+    else{
+        // Sumar Log-Odds y aplicar límites 
         log_odds_grid_[index] += l_update;
-        if (log_odds_grid_[index] > 5.0f) log_odds_grid_[index] = 5.0f;
-        if (log_odds_grid_[index] < -5.0f) log_odds_grid_[index] = -5.0f;
+        // (clamping)
+        //if (log_odds_grid_[index] > 5.0f) log_odds_grid_[index] = 5.0f;
+        //if (log_odds_grid_[index] < -5.0f) log_odds_grid_[index] = -5.0f;
+        log_odds_grid_[index] = std::clamp(log_odds_grid_[index], -5.0f, 5.0f);
+
     }
 }
-
-void OccupancyGridBuilder::update_occupancy_grid() {
-    for (size_t i = 0; i < log_odds_grid_.size(); ++i) {
+// 0 = ocupado, -1 = libre, 100 = desconocido
+void OccupancyGridBuilder::update_occupancy_grid(){
+    constexpr float OCCUPIED_THRESH = 0.65f;
+    constexpr float FREE_THRESH     = 0.35f;
+    for (size_t i = 0; i < log_odds_grid_.size(); ++i){
         float lo = log_odds_grid_[i];
-        if (std::abs(lo) < 0.01f) {
-            grid_data_[i] = -1; // Desconocido
-        } else { // CHEQUEAR ESTO Y ACORDARSE DEL UMBRAL
-            // Convertir de Log-Odds a probabilidad P = 1 - 1/(1 + exp(lo))
-            float p = 1.0f - (1.0f / (1.0f + std::exp(lo)));
-            grid_data_[i] = static_cast<int8_t>(p * 100.0f);
+        // Nunca observado
+        if (lo == 0.0f){
+            grid_data_[i] = 100;//-1
+            continue;
         }
+        // Log-odds -> probabilidad
+        float p = 1.0f - (1.0f / (1.0f + std::exp(lo)));
+        if (p > OCCUPIED_THRESH)    grid_data_[i] = 0;
+        else if (p < FREE_THRESH)   grid_data_[i] = -1;
+        else    grid_data_[i] = 100;
     }
-}
-
-// FIJARSE QUE SEA IGUAL AL DE LA MATERIA
-float OccupancyGridBuilder::quaternion_to_yaw(const geometry_msgs::msg::Quaternion& q) {
-    float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
-    float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
-    return static_cast<float>(std::atan2(siny_cosp, cosy_cosp));
 }
 
 void OccupancyGridBuilder::publish_map() {
@@ -218,10 +196,10 @@ bool OccupancyGridBuilder::update_laser_tf(const rclcpp::Time &required_time)
 { 
   try
   {
-    // lookupTransform da la transformación que convierte puntos expresados en laser_frame al frame robot_frame, válida en required_time
+    // lookupTransform da la transformación que convierte puntos expresados en laser_frame al frame map_frame, válida en required_time
     geometry_msgs::msg::TransformStamped transformStamped = tf_buffer.lookupTransform(
-        robot_frame, laser_frame, required_time, tf2::durationFromSec(0.1));
-    tf2::fromMsg(transformStamped.transform, laser_transform);
+        map_frame, laser_frame, required_time, tf2::durationFromSec(0.1));
+    tf2::fromMsg(transformStamped.transform, transform_laser_world);
     return true;
   }
   catch (tf2::TransformException &ex)
@@ -230,4 +208,17 @@ bool OccupancyGridBuilder::update_laser_tf(const rclcpp::Time &required_time)
                 robot_frame.c_str(), laser_frame.c_str(), ex.what());
     return false;
   }
+}
+
+// Cuando necesite devuelvo directo gx y gy (Bresenham)
+inline bool OccupancyGridBuilder::worldToIndex(double wx, double wy, int &index) const{
+    int gx = static_cast<int>((wx - origin_x_) / resolution_);
+    int gy = static_cast<int>((wy - origin_y_) / resolution_);
+
+    if (gx < 0 || gx >= static_cast<int>(width_cells_) ||
+        gy < 0 || gy >= static_cast<int>(height_cells_))
+        return false;
+
+    index = gy * width_cells_ + gx;
+    return true;
 }
